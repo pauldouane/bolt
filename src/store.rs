@@ -1,15 +1,17 @@
-use std::alloc::System;
-use std::error::Error;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufReader, Read, Write};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::{Duration, SystemTime, SystemTimeError};
+use crate::entry::Entry;
+use crate::core::ReplOutput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use crate::entry::Entry;
+use std::alloc::System;
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
+use std::process::Output;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{Duration, SystemTime, SystemTimeError};
 
-const MAGIC_NUMBER: &[u8] = b"BOLT";  // 4 octets ASCII
+const MAGIC_NUMBER: &[u8] = b"BOLT"; // 4 octets ASCII
 const DATA_FILE: &str = "data.bolt";
 
 #[derive(Serialize, Deserialize)]
@@ -19,10 +21,8 @@ pub(crate) struct Store {
 
 impl Store {
     pub(crate) fn new() -> Self {
-        Store::load_from_file(DATA_FILE).unwrap_or_else(|_err| {
-            Store {
-                data: RwLock::new(HashMap::new()),
-            }
+        Store::load_from_file(DATA_FILE).unwrap_or_else(|_err| Store {
+            data: RwLock::new(HashMap::new()),
         })
     }
 
@@ -61,22 +61,22 @@ impl Store {
             read_lock.get(key).cloned()
         };
         match entry_opt {
-            Some(entry) => {
-                match Store::check_ttl(&entry) {
-                    Ok(entry_is_valid) => {
-                        if entry_is_valid { Some(entry) } else {
-                            self.delete(key);
-                            None
-                        }
-                    },
-                    Err(e) => panic!("TTL error: {}", e),
+            Some(entry) => match Store::check_ttl(&entry) {
+                Ok(entry_is_valid) => {
+                    if entry_is_valid {
+                        Some(entry)
+                    } else {
+                        self.delete(key);
+                        None
+                    }
                 }
+                Err(e) => panic!("TTL error: {}", e),
             },
             None => None,
         }
     }
 
-    fn delete(&self, key: &str) -> bool {
+    pub(crate) fn delete(&self, key: &str) -> bool {
         let mut write_lock = self.data.write().unwrap();
         if !write_lock.contains_key(key) {
             return false;
@@ -85,9 +85,28 @@ impl Store {
         true
     }
 
-    fn keys(&self) -> Vec<String> {
+    fn delete_given_keys(&self, keys: &Vec<String>) {
+        for key in keys {
+            self.delete(&key);
+        }
+    }
+
+    pub(crate) fn keys(&self, output: &ReplOutput) {
         let read_lock: RwLockReadGuard<HashMap<String, Entry>> = self.data.read().unwrap();
-        read_lock.keys().cloned().collect()
+        read_lock
+            .keys()
+            .for_each(|k| output.repl_write_line(format!("\r{}", k)).unwrap());
+    }
+
+    pub fn save_to_file(&self) -> std::io::Result<()> {
+        self.purge_expired();
+        let map: RwLockReadGuard<HashMap<String, Entry>> = self.data.read().unwrap();
+        let binary_data: Vec<u8> = serde_json::to_vec(&*map)?;
+
+        let mut file = File::create(DATA_FILE)?;
+        file.write_all(MAGIC_NUMBER)?;
+        file.write_all(&binary_data)?;
+        Ok(())
     }
 
     pub fn check_ttl(entry: &Entry) -> Result<bool, SystemTimeError> {
@@ -97,21 +116,29 @@ impl Store {
                 let now = SystemTime::now();
                 if now > expire_at {
                     return Ok(false);
-                } else {
-                    println!("TTL: {:?}", expire_at.duration_since(now)?);
                 }
                 Ok(true)
             }
         }
     }
 
-    pub fn save_to_file(&self) -> std::io::Result<()> {
-        let map: RwLockReadGuard<HashMap<String, Entry>> = self.data.read().unwrap();
-        let binary_data: Vec<u8> = serde_json::to_vec(&*map)?;
-
-        let mut file = File::create(DATA_FILE)?;
-        file.write_all(MAGIC_NUMBER)?;
-        file.write_all(&binary_data)?;
-        Ok(())
+    pub fn purge_expired(&self) {
+        let entry_opt: Vec<String> = {
+            let read_lock = self.data.read().unwrap();
+            read_lock
+                .iter()
+                .filter_map(|(k, v)| match Store::check_ttl(&v) {
+                    Ok(entry_is_valid) => {
+                        if entry_is_valid {
+                            None
+                        } else {
+                            Some(k.clone())
+                        }
+                    }
+                    Err(e) => panic!("TTL error: {}", e),
+                })
+                .collect()
+        };
+        self.delete_given_keys(&entry_opt);
     }
 }

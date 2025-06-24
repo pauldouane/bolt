@@ -1,1 +1,1 @@
-BOLT{"key1":{"value":"value1","expire_at":null}}
+BOLT{"key2":{"value":"value2","expire_at":null},"key1":{"value":"value1","expire_at":null}}
